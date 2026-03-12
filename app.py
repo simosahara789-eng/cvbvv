@@ -186,7 +186,7 @@ def download_images(session, listing, listing_id, max_workers=8):
 
 
 def create_listing(session, api_key, original_listing, shipping_profile_id, price_multiplier):
-    """Create new listing based on original."""
+    """Create new listing based on original and return {id, listing_data}."""
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Accept-Version": "3.0",
@@ -262,9 +262,10 @@ def create_listing(session, api_key, original_listing, shipping_profile_id, pric
 
         if isinstance(data, dict):
             if "listing" in data and isinstance(data["listing"], dict):
-                return data["listing"].get("id")
+                created = data["listing"]
+                return {"id": created.get("id"), "listing_data": created}
             if "id" in data:
-                return data["id"]
+                return {"id": data["id"], "listing_data": data}
 
         return None
 
@@ -289,6 +290,57 @@ def _listing_image_endpoints(listing_id):
     ]
 
 
+def _extract_href(value):
+    if isinstance(value, dict):
+        href = value.get("href")
+        if isinstance(href, str):
+            return href
+    if isinstance(value, str):
+        return value
+    return None
+
+
+def _extract_upload_endpoints_from_listing_data(listing_data):
+    if not isinstance(listing_data, dict):
+        return []
+
+    links = listing_data.get("_links")
+    if not isinstance(links, dict):
+        return []
+
+    candidates = []
+    for key in ["images", "photos", "add_photo", "add_image", "upload_photo", "upload_image"]:
+        if key in links:
+            href = _extract_href(links[key])
+            if href:
+                candidates.append(href)
+
+    unique = []
+    seen = set()
+    for endpoint in candidates:
+        if endpoint not in seen:
+            seen.add(endpoint)
+            unique.append(endpoint)
+    return unique
+
+
+def _get_listing_data(session, api_key, listing_id):
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept-Version": "3.0",
+    }
+    for endpoint in _listing_read_endpoints(listing_id):
+        try:
+            response = session.get(endpoint, headers=headers, timeout=12)
+            if response.status_code == 200:
+                data = response.json()
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            continue
+    return None
+
+
 def wait_until_listing_ready(session, api_key, listing_id, max_wait_seconds=35):
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -308,26 +360,16 @@ def wait_until_listing_ready(session, api_key, listing_id, max_wait_seconds=35):
 
 
 def get_photo_count(session, api_key, listing_id):
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Accept-Version": "3.0",
-    }
-    for endpoint in _listing_read_endpoints(listing_id):
-        try:
-            response = session.get(endpoint, headers=headers, timeout=12)
-            if response.status_code != 200:
-                continue
-            data = response.json()
-            if isinstance(data, dict):
-                photos = data.get("photos") or data.get("images") or []
-                if isinstance(photos, list):
-                    return len(photos)
-        except Exception:
-            continue
+    data = _get_listing_data(session, api_key, listing_id)
+    if not isinstance(data, dict):
+        return 0
+    photos = data.get("photos") or data.get("images") or []
+    if isinstance(photos, list):
+        return len(photos)
     return 0
 
 
-def upload_images(session, api_key, listing_id, image_paths):
+def upload_images(session, api_key, listing_id, image_paths, created_listing_data=None):
     """Upload images with endpoint fallback and robust multipart field handling."""
     if not image_paths:
         st.warning("No images to upload")
@@ -346,7 +388,16 @@ def upload_images(session, api_key, listing_id, image_paths):
     status_text = st.empty()
     successful_uploads = 0
 
-    endpoints = _listing_image_endpoints(listing_id)
+    discovered_endpoints = _extract_upload_endpoints_from_listing_data(created_listing_data)
+    listing_data = _get_listing_data(session, api_key, listing_id)
+    discovered_endpoints.extend(_extract_upload_endpoints_from_listing_data(listing_data))
+    fallback_endpoints = _listing_image_endpoints(listing_id)
+    endpoints = []
+    seen = set()
+    for endpoint in discovered_endpoints + fallback_endpoints:
+        if endpoint and endpoint not in seen:
+            seen.add(endpoint)
+            endpoints.append(endpoint)
     field_names = ["photo", "image", "file"]
 
     for i, image_path in enumerate(image_paths):
@@ -573,18 +624,19 @@ if st.button("🚀 Start Cloning", type="primary", use_container_width=True):
         st.success(f"✅ Downloaded {len(image_paths)} images")
 
         st.info("📝 Creating new listing...")
-        new_listing_id = create_listing(session, api_key, original_listing, shipping_profile_id, price_multiplier)
-        if not new_listing_id:
+        created_listing = create_listing(session, api_key, original_listing, shipping_profile_id, price_multiplier)
+        if not created_listing or not created_listing.get("id"):
             cleanup_images(image_paths, keep_images=True)
             summary.append((listing_url, None, "create_failed"))
             continue
 
+        new_listing_id = created_listing["id"]
         st.success(f"✅ Created new listing with ID: {new_listing_id}")
 
         upload_success = True
         if image_paths:
             st.info("📤 Uploading images...")
-            upload_success = upload_images(session, api_key, new_listing_id, image_paths)
+            upload_success = upload_images(session, api_key, new_listing_id, image_paths, created_listing_data=created_listing.get("listing_data"))
             if upload_success:
                 st.success("✅ Images uploaded successfully")
             else:
